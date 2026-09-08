@@ -190,33 +190,34 @@ git add migrations/001_retrieval_schema.sql README.md
 git commit -m "fix: repair the incident retrieval schema to match the spec"
 ```
 
-2. Update this `README.md` with exactly **3 retrieval-model decisions** and **1 rejected shape**:
+2. Documented retrieval-model decisions and rejected shape:
 
-```markdown
 ## Retrieval-Model Decisions
 
-### Decision 1: [Embedding storage decision]
-Spec said: ...
-Schema decided: ...
-Reason: ...
+### Decision 1: Storing Embeddings as Native pgvector `vector(1536)`
+Spec said: `embedding vector(1536) NOT NULL` — the embedding vector (pgvector type).
+Schema decided: Enabled the `vector` extension (`CREATE EXTENSION IF NOT EXISTS vector;`) and defined `embedding vector(1536) NOT NULL` on `incident_chunks` with an HNSW Approximate Nearest Neighbor (ANN) index using `vector_cosine_ops`.
+Reason: Retrieval storage is fundamentally designed for vector similarity search. Storing vectors as generic `TEXT`, `JSON`, or `float8[]` arrays prevents the database from performing native vector operations or using vector distance operators such as cosine distance (`<=>`). The native `vector(1536)` type from `pgvector` enforces strict dimensionality constraints at write time, optimizes contiguous storage layout for dense float arrays, and enables fast sub-linear similarity search via the HNSW index without needing full-table sequential scans or application-level distance math.
 
-### Decision 2: [ON DELETE decision]
-Spec said: ...
-Schema decided: ...
-Reason: ...
+### Decision 2: Foreign Key Integrity with `ON DELETE CASCADE`
+Spec said: `incident_id BIGINT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE` ("a chunk has no meaning without its incident").
+Schema decided: Defined `incident_id BIGINT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE` on `incident_chunks` along with a supporting B-tree index `idx_incident_chunks_incident_id`.
+Reason: `incident_chunks` represents derived data produced by chunking and embedding the authoritative incident text. Chunks have no lifecycle or meaning independent of the incident they describe. If an incident is deleted, orphaned chunks left in the vector store would surface "ghost" matches pointing to missing incidents, corrupting AI summaries and breaking foreign key lookups. Enforcing `ON DELETE CASCADE` guarantees referential integrity at the database engine level, ensuring all chunks and their vectors are automatically pruned atomically when an incident is deleted.
 
-### Decision 3: [Filter-metadata / denormalisation decision]
-Spec said: ...
-Schema decided: ...
-Reason: ...
+### Decision 3: Denormalising Filter Metadata (`team_id` and `severity`) onto Chunks
+Spec said: `team_id BIGINT NOT NULL` and `severity TEXT NOT NULL` as denormalised filter metadata on `incident_chunks`.
+Schema decided: Denormalised and stored `team_id BIGINT NOT NULL` and `severity TEXT NOT NULL` directly in `incident_chunks`, copied from `incidents`.
+Reason: The production query pattern is hybrid retrieval: filtering incidents by relational attributes (e.g. searching only for a specific team's past incidents or matching severity levels such as P1/P2) combined with ANN similarity ranking. If metadata resided solely on `incidents`, vector search would either require expensive relational joins during index traversal or post-filtering after retrieving candidate vector neighbors (which causes over-fetching or under-fetching where valid results are filtered out, returning fewer than the requested top-k items). Denormalising these columns allows pre-filtering and combined query execution directly at the vector store index level.
 
 ## Rejected Shape
 
-### Shape: [name what you removed or rejected]
-What it was: ...
-Why rejected: ...
-What would break: ...
-```
+### Shape: Single embedding column bolted onto `incidents` (`ALTER TABLE incidents ADD COLUMN embedding TEXT;`)
+What it was: A single `embedding TEXT` column added directly to the parent `incidents` table.
+Why rejected: Incidents contain lengthy, multi-paragraph text across titles, descriptions, timelines, and resolution notes. A 1:1 mapping between an incident and an embedding fails due to token limits and loss of retrieval granularity. Compressing an entire incident into a single vector dilutes specific technical signals and details. Furthermore, storing it as `TEXT` instead of `vector` prevented native vector indexing and distance calculations.
+What would break:
+1. **Retrieval Granularity & Needle-in-a-Haystack Loss**: Compressing multi-paragraph postmortems into one vector dilutes specific error messages, stack traces, and resolution steps. A responder querying with a specific symptom will get a weak similarity score against a diluted monolithic embedding, causing relevant past incidents to be missed entirely.
+2. **Context Length Truncation**: Long incidents exceed embedding model token limits (e.g., 8,192 tokens), silently truncating critical resolution steps or error outputs located further down in the text.
+3. **Grounded Generation Failure**: The AI assistant needs concise, relevant text passages to draft accurate summaries. Surfacing an entire monolithic incident forces the LLM to process excessive, noisy context, increasing latency, costs, and hallucinations.
 
 
 3. Push and open a PR:
